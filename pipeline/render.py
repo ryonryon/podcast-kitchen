@@ -12,6 +12,8 @@ import numpy as np
 from common import dump, load, load_cfg, log_step, read_wav, speakers, write_wav, r
 
 APPLY = ("cut", "duck", "mute")
+# Episode-local / structural edits are not required to have a candidates.json key.
+EXTRA_EDIT_TYPES = ("manual", "opening_chatter", "edge_trim", "laughter_local")
 
 
 def roomtone(x, sr, isl, secs, rise_db=15, floor_min_db=-80):
@@ -147,7 +149,7 @@ def main():
     if missing:
         raise SystemExit(f"render: {len(missing)} unlabeled candidates; refusing to render")
     edits = load(ep / "work/edits.json")
-    if {e["key"] for e in edits if e["type"] not in ("manual", "opening_chatter", "edge_trim")} != {x["key"] for x in cands}:
+    if {e["key"] for e in edits if e["type"] not in EXTRA_EDIT_TYPES} != {x["key"] for x in cands}:
         raise SystemExit("render: edits.json is stale vs candidates.json; run label_store.py build")
     vad = load(ep / "work/vad.json")
     spk = speakers(ep)

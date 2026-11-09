@@ -138,10 +138,27 @@ candidates:
     enabled: true
     keep_overlap_yield: true
     min_conf: 0.5
+  overlap_laughter:             # pure overlapping laughter only. Mute loses on one track; the timeline stays.
+    enabled: true
+    min_overlap_s: 0.2          # all named speakers must overlap by at least this (a chain of pairs is not a triple)
+    min_span_s: 0.15            # ignore a shorter pure-laugh span
+    merge_gap_s: 0.25           # join same-speaker pure-laugh spans separated by <= this
+    max_laugh_chars: 40         # longer text is not a pure laugh
+    max_speech_overlap_s: 0.0   # same-speaker non-laugh overlapping a laugh word by more than this = mixed, left untouched
+    require_status_ok: true     # rejected / low alignment is ambiguous and is not muted
+    min_word_score: null        # null = align.min_word_score
+    mute_extent: overlap_only   # overlap_only | full_span (full_span reviews the span if win/lose conflicts)
+    respect_edge_protect: true  # head/tail (protect_head_tail_s) stays human review
+    max_decided_speakers: 3     # more simultaneous pure laughs -> review, no mute
+    two_speaker: review         # review | role_map. No built-in winner for exactly two laughs.
+    two_speaker_role_winners: {} # only if two_speaker is role_map. Key "role+role" (order ignored) -> winning role. Empty = review.
+    primary_host_role: primary_host
+    interviewee_role: interviewee
+    roles_manifest_key: speaker_roles  # episode manifest.json only; do not put track mappings in this repo
 
 labels:
   # rule labels on these types are auto-approved; everything else needs approved: true
-  auto_approve_types: [long_pause, filler, backchannel, overlap_restart, overlap_abandon, mutual_yield]
+  auto_approve_types: [long_pause, filler, backchannel, overlap_restart, overlap_abandon, mutual_yield, overlap_laughter]
 
 render:
   duck_db: -20                  # the only duck depth
@@ -179,23 +196,39 @@ jingle:                         # mid-show jingle, inserted ONCE (pipeline/jingl
   own_silence_s: 0.3            # shifted speaker must be silent at least this long before the onset (split lands in silence)
   max_tail_overlap_s: 1.5       # another track's substantive line may run at most this past the onset (else overlap -> reject)
 
-ending_bgm:                     # render stage, after mix, before loudness (pipeline/ending_bgm.py)
+ending_bgm:                     # render stage, after mix, before loudness (pipeline/ending_bgm.py). Not the mid-show jingle.
   enabled: true
-  file: ../../assets/ending_bgm.mp3   # absolute, or relative to the episode dir; audio is never committed to the repo
-  phrases: ["ということで"]       # closing phrase(s); the LAST occurrence within search_window_s of the end is used
+  mode: full_asset              # full_asset | phrase_tail. Absent key in an older episode config = phrase_tail.
+  file: ../../assets/ending_bgm.mp3   # music asset. Absolute, or relative to the episode dir. Never commit the audio.
+  # phrase_tail (legacy): fade in lead_in_s before the last closing phrase, bed under speech, rise after the last
+  # speech, hold tail_s, fade_out_s, then end_silence_s. A longer file is not played past that envelope.
+  phrases: ["ということで"]       # phrase_tail only. LAST occurrence within search_window_s of the voice-mix end.
   search_window_s: 120
-  lead_in_s: 3.0                # BGM fade-in starts this long before the phrase
-  fade_in_s: 2.0
-  bed_db: -20                   # bed level under the voices, dB relative to the voices' active level (-18 .. -22)
-  voice_ref_window_s: 60        # voice active level measured over this long before the last speech end
+  lead_in_s: 3.0                # phrase_tail: fade-in starts this long before the phrase. full_asset: unused for placement.
+  fade_in_s: 2.0                # entrance ramp at the asset start (does not drop the tail)
+  bed_db: -20                   # under speech, dB relative to the voices' active level (-18 .. -22)
+  voice_ref_window_s: 60        # voice active level measured over this long before the gain speech end
   min_island_s: 0.2             # VAD islands shorter than this don't count as the last speech
-  ramp_s: 1.5                   # after the last speech end (all speakers), ramp bed -> tail level
-  tail_db: -4                   # BGM-only level, dB relative to the voices' active level
-  tail_s: 5.0                   # BGM-only time after the last speech end (incl. ramp)
-  fade_out_s: 7.0               # fade-out, linear in dB (exponential in amplitude) from tail_db ...
-  fade_out_floor_db: -60        # ... down to this (dB re voice active level), then gain 0
-  end_silence_s: 1.5            # digital silence appended after the fade (QA edge/tail checks stop at the fade start)
-  bgm_offset_s: 0.0             # start position inside the BGM file
+  ramp_s: 1.5                   # after the gain speech end, ramp bed -> tail level. Does not shorten the file.
+  tail_db: -4                   # post-speech level, dB relative to the voices' active level
+  tail_s: 5.0                   # phrase_tail only: BGM-only time after the last speech end (incl. ramp)
+  fade_out_s: 7.0               # phrase_tail only: fade-out, linear in dB, from tail_db ...
+  fade_out_floor_db: -60        # phrase_tail only: ... down to this, then gain 0
+  end_silence_s: 1.5            # digital silence AFTER the music payload (full_asset) or after the fade (phrase_tail)
+  bgm_offset_s: 0.0             # samples before this in the music file are skipped; the rest through EOF is the payload
+  # full_asset: play that payload once. No loop. tail_s / fade_out_s do not crop it. Natural tail stays at tail_db
+  # (or bed_db if the payload ends at/before the gain speech end). tail_fade_ms 0 = do not fade the last samples.
+  end_anchor: episode_end       # episode_end | speech_end | explicit. Where the shared asset end aims.
+  end_anchor_s: null            # explicit only: seconds on the edited timeline. Set in the episode config, not here.
+  music_start_s: null           # optional edited-timeline start. End is then this + payload length (episode may grow).
+  outro_file: ""                # optional second asset. Empty = music only. Same path rules; never commit the audio.
+  outro_offset_s: 0.0           # skip this much of the outro file; the rest through EOF is the payload
+  outro_start_s: null           # optional edited-timeline start. See playbook for which end wins when both starts are set.
+  outro_bed_db: null            # null = bed_db. Per-asset level under speech.
+  outro_tail_db: null           # null = tail_db
+  start_floor_s: 0.0            # derived starts are shifted later together rather than cropped before this time
+  gain_speech_end_s: null       # null = last qualifying VAD end. Only the bed->tail rise; not the file end.
+  tail_fade_ms: 0               # full_asset only. 0 keeps the payload's last samples at the hold level.
 
 loudness:                       # one tool: ffmpeg loudnorm two-pass, must be linear
   target_lufs: -16
