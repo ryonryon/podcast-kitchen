@@ -30,6 +30,27 @@ def test_build_schema_and_review_never_approved(cfg):
     assert ed[2]["approved"] is False
 
 
+def test_laughter_edits_are_one_track_mutes(tmp_path):
+    import json
+    (tmp_path / "laughter_edits.json").write_text(json.dumps([
+        {"track": "guest_b", "start": 12.0, "end": 13.5, "action": "mute", "kind": "laughter", "approved": True, "note": "pure laugh interval"}]))
+    rows = L.laughter_local(tmp_path)
+    assert rows[0]["type"] == "laughter_local" and rows[0]["action"] == "mute" and rows[0]["approved"] and rows[0]["track"] == "guest_b"
+    (tmp_path / "laughter_edits.json").write_text(json.dumps([
+        {"track": "guest_a", "start": 1.0, "end": 2.0, "kind": "laughter", "action": "mute"}]))
+    assert L.laughter_local(tmp_path)[0]["approved"] is False
+    for bad in (
+        [{"track": "all", "start": 1, "end": 2, "action": "mute", "kind": "laughter"}],
+        [{"track": "guest_a", "start": 1, "end": 2, "action": "cut", "kind": "laughter"}],
+        [{"track": "guest_a", "start": 1, "end": 2, "action": "mute", "kind": "speech"}],
+        [{"track": "guest_a", "start": 2, "end": 1, "action": "mute", "kind": "laughter"}],
+        {"track": "guest_a"},
+    ):
+        (tmp_path / "laughter_edits.json").write_text(json.dumps(bad))
+        with pytest.raises(SystemExit):
+            L.laughter_local(tmp_path)
+
+
 def test_manual_edits_appended(tmp_path):
     import json
     import label_store as LS

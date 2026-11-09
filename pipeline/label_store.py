@@ -10,6 +10,9 @@ Labels are never regenerated: `seed` only adds missing keys with the rule defaul
 edits.json entry: {id, key, type, track, start, end, action, approved, labeler, reason, excerpt, confidence, note}
 manual_edits.json (optional, episode root): [{start, end, track, action, approved, note}] for edits no rule can find
 (e.g. a retake the ASR merged away). They are appended as type "manual" with key m-<start>-<end>.
+laughter_edits.json (optional, episode root, never committed): laughter-only mutes the rules did not apply.
+Each item is {track, start, end, action: "mute", kind: "laughter", approved: true|false, note?}.
+One speaker track (not "all"); the timeline is not cut. Applied as type "laughter_local".
 Structural edits (config `structure`, built every time, not labels):
   opening_chatter  cut [0, theme start - lead_s): theme start = first raw/transcript.csv line containing
                    manifest/config structure.opening_chatter.start_text, else the first line at >= min_s matching
@@ -18,7 +21,7 @@ Structural edits (config `structure`, built every time, not labels):
 Render applies an entry only if approved is true and action in {cut, duck, mute}."""
 import argparse, sys
 from pathlib import Path
-from common import dump, load, load_cfg
+from common import dump, load, load_cfg, r
 
 ACTIONS = ("cut", "duck", "mute", "keep", "review")
 
@@ -58,6 +61,39 @@ def manual(ep):
         out.append({"id": f"m{i:04d}", "key": f"m-{m['start']:.3f}-{m['end']:.3f}", "type": "manual", "track": m.get("track", "all"),
                     "start": m["start"], "end": m["end"], "action": m["action"], "approved": bool(m.get("approved")) and m["action"] != "review",
                     "labeler": m.get("by", "agent"), "reason": "manual edit", "excerpt": m.get("excerpt", ""), "confidence": 1.0, "note": m.get("note", "")})
+    return out
+
+
+def laughter_local(ep):
+    """Episode-local pure-laughter mutes. Rejects anything that is not one-track mute of kind laughter."""
+    p = ep / "laughter_edits.json"
+    if not p.exists():
+        return []
+    rows = load(p)
+    if not isinstance(rows, list):
+        raise SystemExit("laughter_edits.json must be a list")
+    out = []
+    for i, m in enumerate(rows):
+        if not isinstance(m, dict):
+            raise SystemExit(f"laughter_edits.json[{i}] must be an object")
+        track = m.get("track")
+        if m.get("kind") != "laughter" or m.get("action", "mute") != "mute" or not isinstance(track, str) or track.strip() in ("", "all"):
+            raise SystemExit(f"laughter_edits.json[{i}] must be kind=laughter, action=mute, and one speaker track")
+        if "approved" in m and not isinstance(m["approved"], bool):
+            raise SystemExit(f"laughter_edits.json[{i}] approved must be a boolean")
+        note = m.get("note", "")
+        if not isinstance(note, str):
+            raise SystemExit(f"laughter_edits.json[{i}] note must be a string")
+        try:
+            start, end = r(float(m["start"])), r(float(m["end"]))
+        except (KeyError, TypeError, ValueError):
+            raise SystemExit(f"laughter_edits.json[{i}] needs numeric start and end")
+        if start < 0 or not end > start:
+            raise SystemExit(f"laughter_edits.json[{i}] end must be after start")
+        out.append({"id": f"l{i:04d}", "key": f"laugh-{i}-{track}-{start:.3f}-{end:.3f}", "type": "laughter_local",
+                    "track": track, "start": start, "end": end, "action": "mute", "approved": m.get("approved") is True,
+                    "labeler": "human", "reason": "episode-local overlapping-laughter mute; one speaker; timeline kept",
+                    "excerpt": "", "confidence": 1.0, "note": note})
     return out
 
 
@@ -126,7 +162,7 @@ def main():
                 L["approved"] = True; n += 1
         dump(lp, labels); print("approved", n)
     elif a.cmd == "build":
-        e = build(cands, labels) + manual(ep) + structural(ep, cfg); dump(ep / "work/edits.json", e)
+        e = build(cands, labels) + manual(ep) + laughter_local(ep) + structural(ep, cfg); dump(ep / "work/edits.json", e)
         print("edits", len(e), "applied", sum(1 for x in e if x["approved"] and x["action"] in ("cut", "duck", "mute")))
     else:
         from collections import Counter

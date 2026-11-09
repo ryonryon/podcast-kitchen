@@ -21,6 +21,10 @@ def test_crossfade_equal_power_constant_signal():
     assert out["a"].min() >= 0.99 and out["a"].max() <= 1.42
 
 
+def test_laughter_local_is_not_a_candidate_key():
+    assert "laughter_local" in R.EXTRA_EDIT_TYPES
+
+
 def test_merge_overlapping():
     m = R.merge([(5, 8, ["b"]), (1, 3, ["a"]), (2, 4, ["c"])])
     assert [tuple(i[:2]) for i in m] == [(1, 4), (5, 8)]

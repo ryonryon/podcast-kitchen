@@ -217,6 +217,176 @@ def test_overlap_abandon_mutes_only_abandoner(cfg):
     assert "overlap_abandon" in cfg["labels"]["auto_approve_types"]
 
 
+def _laughs(spans, dur=120.0):
+    sp, words = {}, {}
+    for s, t0, t1, text in spans:
+        sp.setdefault(s, []).append([t0, t1])
+        words.setdefault(s, []).append(seg(t0, t1, text))
+    return vad(sp, dur), words
+
+
+def _ol(cs):
+    return [c for c in cs if c["type"] == "overlap_laughter"]
+
+
+def _acts(cs):
+    return {c["track"]: c["default_action"] for c in cs}
+
+
+ROLES3 = {"host": "primary_host", "guest_a": "interviewee", "guest_b": "participant"}
+
+
+def _triple():
+    return _laughs([("host", 10.0, 11.6, "ははは"), ("guest_a", 10.0, 11.6, "(笑)"), ("guest_b", 10.0, 11.6, "ふふふ")])
+
+
+def test_pure_laugh_text_is_markers_only(cfg):
+    marks = cfg["text"]["laugh_markers"]
+    for ok in ("ははは", "はは", "(笑)", "ｗｗｗ", "ふふふ", "草", "ハハハハ", "はは！"):
+        assert C.is_pure_laugh(ok, marks), ok
+    for bad in ("は", "ww", "うん", "はい", "本当？", "ははは？", "面白い(笑)", "あはは", "笑顔", "", "質問です"):
+        assert not C.is_pure_laugh(bad, marks), bad
+    for word in cfg["text"]["backchannels"] + cfg["text"]["fillers"]:
+        assert not C.is_pure_laugh(word, marks), word
+
+
+def test_two_laughs_have_no_built_in_winner(cfg):
+    ol = cfg["candidates"]["overlap_laughter"]
+    assert ol["two_speaker"] == "review" and ol["two_speaker_role_winners"] == {}
+    v, w = _laughs([("host", 10.0, 11.6, "ははは"), ("guest_a", 10.0, 11.6, "ふふふ")])
+    cs = _ol(C.build(v, w, cfg, {"host": "primary_host", "guest_a": "participant"}))
+    assert cs and set(_acts(cs)) == {"host", "guest_a"}
+    assert all(c["default_action"] == "review" and c["track"] != "all" for c in cs)
+    cfg["candidates"]["overlap_laughter"]["two_speaker_role_winners"] = {"primary_host+participant": "participant"}
+    assert all(c["default_action"] == "review" for c in _ol(C.build(v, w, cfg, {"host": "primary_host", "guest_a": "participant"})))
+
+
+def test_two_laughs_use_only_an_explicit_role_map(cfg):
+    v, w = _laughs([("host", 10.0, 11.6, "ははは"), ("guest_a", 10.0, 11.6, "ふふふ")])
+    roles = {"host": "primary_host", "guest_a": "participant"}
+    cfg["candidates"]["overlap_laughter"]["two_speaker"] = "role_map"
+    cfg["candidates"]["overlap_laughter"]["two_speaker_role_winners"] = {"primary_host+participant": "participant"}
+    cs = _ol(C.build(v, w, cfg, roles))
+    assert _acts(cs) == {"host": "mute", "guest_a": "keep"}
+    assert all(c["default_action"] != "cut" for c in cs)
+    cfg["candidates"]["overlap_laughter"]["two_speaker_role_winners"] = {"interviewee+primary_host": "participant"}
+    assert all(c["default_action"] == "review" for c in _ol(C.build(v, w, cfg, {"host": "primary_host", "guest_a": "interviewee"})))
+    cfg["candidates"]["overlap_laughter"]["two_speaker_role_winners"] = {"participant+participant": "participant"}
+    assert all(c["default_action"] == "review" for c in _ol(C.build(v, w, cfg, {"host": "participant", "guest_a": "participant"})))
+    assert all(c["default_action"] == "review" for c in _ol(C.build(v, w, cfg, {"host": "primary_host"})))
+
+
+def test_triple_keeps_unique_third_and_fails_safe(cfg):
+    v, w = _triple()
+    cs = _ol(C.build(v, w, cfg, ROLES3))
+    assert _acts(cs) == {"host": "mute", "guest_a": "mute", "guest_b": "keep"}
+    assert all(c["start"] == 10.0 and c["end"] == 11.6 for c in cs)
+    bare = _ol(C.build(v, w, cfg))
+    assert bare and all(c["default_action"] == "review" for c in bare)
+    two = _ol(C.build(v, w, cfg, {"host": "primary_host", "guest_a": "participant", "guest_b": "participant"}))
+    assert two and all(c["default_action"] == "review" for c in two)
+    missing = _ol(C.build(v, w, cfg, {"host": "primary_host", "guest_a": "interviewee"}))
+    assert missing and all(c["default_action"] == "review" for c in missing)
+    no_third = _ol(C.build(v, w, cfg, {"host": "primary_host", "guest_a": "interviewee", "guest_b": "primary_host"}))
+    assert no_third and all(c["default_action"] == "review" for c in no_third)
+    kept = _ol(C.build(v, w, cfg, {"host": "primary_host", "guest_a": "interviewee", "guest_b": "co_host"}))
+    assert _acts(kept)["guest_b"] == "keep" and _acts(kept)["host"] == "mute"
+    cfg["candidates"]["overlap_laughter"]["primary_host_role"] = "lead"
+    cfg["candidates"]["overlap_laughter"]["interviewee_role"] = "subject"
+    named = _ol(C.build(v, w, cfg, {"host": "lead", "guest_a": "subject", "guest_b": "co_host"}))
+    assert _acts(named) == {"host": "mute", "guest_a": "mute", "guest_b": "keep"}
+
+
+def test_overlap_laughter_does_not_silence_speech_questions_backchannels_or_mixed(cfg):
+    v, w = _laughs([
+        ("host", 10.0, 14.0, "それで本題です"),
+        ("guest_a", 10.2, 11.8, "ははは"),
+        ("guest_b", 10.2, 11.8, "ふふふ"),
+        ("guest_c", 10.2, 11.8, "(笑)"),
+    ])
+    roles = {"guest_a": "interviewee", "guest_b": "primary_host", "guest_c": "participant"}
+    cs = _ol(C.build(v, w, cfg, roles))
+    assert "host" not in _acts(cs) and _acts(cs)["guest_c"] == "keep"
+    v, w = _laughs([("host", 10.0, 11.6, "本当？"), ("guest_a", 10.0, 11.6, "ははは"), ("guest_b", 10.0, 11.6, "ふふふ")])
+    q = _ol(C.build(v, w, cfg))
+    assert q and "host" not in _acts(q)
+    v, w = _laughs([("host", 10.0, 11.6, "うん"), ("guest_a", 10.0, 11.6, "ははは"), ("guest_b", 10.0, 11.6, "ふふふ")])
+    bc = _ol(C.build(v, w, cfg))
+    assert bc and "host" not in _acts(bc)
+    speech = seg(10.0, 12.5, "それでははは", [
+        {"surface": "それで", "kana": "ソレデ", "pos": "接続詞", "start": 10.0, "end": 12.5, "score": 0.9},
+        {"surface": "ははは", "kana": "ハハハ", "pos": "感動詞", "start": 11.0, "end": 12.0, "score": 0.9},
+    ])
+    other = seg(11.0, 12.0, "ふふふ")
+    vv = vad({"host": [[10.0, 12.5]], "guest_a": [[11.0, 12.0]]})
+    assert not _ol(C.build(vv, {"host": [speech], "guest_a": [other]}, cfg))
+    separated = seg(10.0, 12.4, "それでははは", [
+        {"surface": "それで", "kana": "ソレデ", "pos": "接続詞", "start": 10.0, "end": 11.0, "score": 0.9},
+        {"surface": "ははは", "kana": "ハハハ", "pos": "感動詞", "start": 11.2, "end": 12.4, "score": 0.9},
+    ])
+    guest = seg(11.3, 12.3, "ふふふ")
+    vv = vad({"host": [[10.0, 12.4]], "guest_a": [[11.3, 12.3]]})
+    host_cs = [c for c in _ol(C.build(vv, {"host": [separated], "guest_a": [guest]}, cfg)) if c["track"] == "host"]
+    assert host_cs and host_cs[0]["start"] >= 11.2 and host_cs[0]["default_action"] == "review"
+    low = _laughs([("host", 10.0, 11.6, "ははは"), ("guest_a", 10.0, 11.6, "ふふふ")])
+    low_w = {s: [seg(g["start"], g["end"], g["text"], score=0.1) for g in gs] for s, gs in low[1].items()}
+    assert not _ol(C.build(low[0], low_w, cfg, ROLES3))
+
+
+def test_chain_and_crowd_are_not_a_triple_mute(cfg):
+    v, w = _laughs([("host", 10.0, 12.0, "ははは"), ("guest_a", 11.0, 13.0, "ふふふ"), ("guest_b", 12.0, 14.0, "(笑)")])
+    chain = _ol(C.build(v, w, cfg, ROLES3))
+    assert chain and all(c["default_action"] == "review" for c in chain)
+    v, w = _laughs([("host", 10, 11.6, "ははは"), ("guest_a", 10, 11.6, "ふふふ"), ("guest_b", 10, 11.6, "(笑)"), ("guest_c", 10, 11.6, "ｗｗｗ")])
+    assert _ol(C.build(v, w, cfg, {**ROLES3, "guest_c": "participant"})) 
+    assert all(c["default_action"] == "review" for c in _ol(C.build(v, w, cfg, {**ROLES3, "guest_c": "participant"})))
+    v, w = _laughs([("host", 10.0, 11.0, "ははは"), ("guest_a", 10.95, 12.0, "ふふふ")])
+    assert not _ol(C.build(v, w, cfg))
+
+
+def test_overlap_laughter_extent_edge_and_switch(cfg):
+    v, w = _laughs([("host", 10.0, 16.0, "ははは"), ("guest_a", 12.0, 13.5, "ふふふ")])
+    roles = {"host": "primary_host", "guest_a": "participant"}
+    cfg["candidates"]["overlap_laughter"]["two_speaker"] = "role_map"
+    cfg["candidates"]["overlap_laughter"]["two_speaker_role_winners"] = {"participant+primary_host": "participant"}
+    clip = [c for c in _ol(C.build(v, w, cfg, roles)) if c["track"] == "host"]
+    assert len(clip) == 1 and clip[0]["default_action"] == "mute" and (clip[0]["start"], clip[0]["end"]) == (12.0, 13.5)
+    cfg["candidates"]["overlap_laughter"]["mute_extent"] = "full_span"
+    whole = [c for c in _ol(C.build(v, w, cfg, roles)) if c["track"] == "host"]
+    assert whole[0]["default_action"] == "mute" and (whole[0]["start"], whole[0]["end"]) == (10.0, 16.0)
+    v, w = _laughs([("host", 0.4, 2.0, "ははは"), ("guest_a", 0.4, 2.0, "(笑)"), ("guest_b", 0.4, 2.0, "ふふふ")])
+    edge = _ol(C.build(v, w, cfg, ROLES3))
+    assert edge and all(c["default_action"] == "review" for c in edge)
+    cfg["candidates"]["overlap_laughter"]["respect_edge_protect"] = False
+    cfg["candidates"]["overlap_laughter"]["mute_extent"] = "overlap_only"
+    assert _acts(_ol(C.build(v, w, cfg, ROLES3)))["guest_b"] == "keep"
+    cfg["candidates"]["overlap_laughter"]["enabled"] = False
+    assert not _ol(C.build(*_triple(), cfg, ROLES3))
+    del cfg["candidates"]["overlap_laughter"]
+    assert not _ol(C.build(*_triple(), cfg, ROLES3))
+
+
+def test_overlap_laughter_review_is_not_auto_kept_and_seed_approves_decisions(cfg):
+    import label_store as L
+    row = {"type": "overlap_laughter", "default_action": "review", "reason": "could be laugh punchline alignment score low", "confidence": 0.2}
+    assert C.auto_decide([row], {"enabled": True, "keep_overlap_yield": True, "min_conf": 0.5})[0]["default_action"] == "review"
+    v, w = _triple()
+    cs = _ol(C.build(v, w, cfg, ROLES3))
+    labels = {}
+    L.seed(cs, labels, cfg)
+    for c in cs:
+        got = labels[c["key"]]
+        if c["default_action"] == "review":
+            assert not got["approved"]
+        else:
+            assert got["approved"] and got["action"] == c["default_action"]
+    vague = _ol(C.build(v, w, cfg))
+    labels = {}
+    L.seed(vague, labels, cfg)
+    assert vague and all(not labels[c["key"]]["approved"] for c in vague)
+    assert [c["key"] for c in C.build(v, w, cfg, ROLES3)] == [c["key"] for c in C.build(v, w, cfg, ROLES3)]
+
+
 def test_overlap_abandon_guards(cfg):
     for t in ("2022年か", "すごいね。", "そうなんだ", "うん", "(笑)"):
         v, w = _abandon_fixture(text=t, words=[RW(t, t, "名詞", 2188.4)])

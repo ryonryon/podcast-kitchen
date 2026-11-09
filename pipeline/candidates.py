@@ -1,9 +1,10 @@
 """Step 4a: deterministic rule candidates -> work/candidates.json (raw seconds, after sync).
 
 Types (config.candidates, config.text): long_pause, filler, backchannel, overlap_yield, overlap_restart,
-overlap_abandon, mutual_yield, false_start,
+overlap_abandon, mutual_yield, false_start, overlap_laughter,
 crosstalk, mistake. Every candidate carries `default_action` from a measurable proxy; anything the
-rules cannot decide is `review`. Timeline cuts use track 'all'; duck/mute act on one track only."""
+rules cannot decide is `review`. Timeline cuts use track 'all'; duck/mute act on one track only.
+overlap_laughter never cuts the timeline and never mutes speech, questions, backchannels, or mixed speech/laughter."""
 import argparse
 import re
 from pathlib import Path
@@ -25,8 +26,9 @@ def norm(s):
 
 
 class Ctx:
-    def __init__(self, vad, words, cfg):
+    def __init__(self, vad, words, cfg, roles=None):
         self.vad, self.words, self.cfg = vad, words, cfg
+        self.roles = roles if isinstance(roles, dict) else {}
         self.c, self.t = cfg["candidates"], cfg["text"]
         self.dur = vad["duration_s"]
         self.spk = sorted(vad["speakers"])
@@ -389,11 +391,327 @@ def mistakes(ctx):
             for a, b, s, g in ctx.segs if any(m in g["text"] for m in ctx.t["mistake_markers"])]
 
 
-def build(vad, words, cfg):
-    ctx = Ctx(vad, words, cfg)
+_LAUGH_STRIP = set(" \t\n\r、。！!・…「」『』（）()[]【】〜~ー－-っッ\"'“”．.,　")
+_W_TRANS = str.maketrans({"Ｗ": "w", "ｗ": "w", "W": "w"})
+_LAUGH_WHY = {
+    "edge": "overlapping pure laughter in protected head/tail; human review, no mute",
+    "too_many": "overlapping pure laughter above max_decided_speakers; human review, no mute",
+    "pair_review": "overlapping pure laughter; two speakers and no configured winner; human review, no mute",
+    "pair_keep": "overlapping pure laughter; configured two-speaker winner kept on this track",
+    "pair_mute": "overlapping pure laughter; mute this track's laughter interval only; timeline kept",
+    "triple_review": "overlapping pure laughter; no unambiguous unique speaker who is neither interviewee nor primary host; human review, no mute",
+    "triple_keep": "overlapping pure laughter; unique speaker who is neither interviewee nor primary host kept",
+    "triple_mute": "overlapping pure laughter; mute this track's laughter interval only; unique third kept; timeline kept",
+    "span_conflict": "overlapping pure laughter; full_span win/lose conflict; human review, no mute",
+}
+
+
+def is_question(text):
+    t = str(text or "")
+    return "?" in t or "？" in t
+
+
+def _laugh_consume(s, markers):
+    if s == "":
+        return True
+    for m in sorted(markers, key=len, reverse=True):
+        if not m or not s.startswith(m):
+            continue
+        if _laugh_consume(s[len(m):], markers):
+            return True
+        if len(set(m)) == 1:
+            k = len(m)
+            while k < len(s) and s[k] == m[0]:
+                k += 1
+            if k > len(m) and _laugh_consume(s[k:], markers):
+                return True
+    return False
+
+
+def is_pure_laugh(text, markers, limit=40):
+    """True when the whole string is laugh markers only (repetitions allowed). Questions and other text are not."""
+    raw = str(text or "").strip()
+    if not raw or is_question(raw) or len(raw) > limit:
+        return False
+    s = "".join(ch for ch in raw if ch not in _LAUGH_STRIP)
+    if not s or len(s) > limit:
+        return False
+    s = s.translate(_W_TRANS)
+    norms = []
+    for m in markers or []:
+        mm = str(m).translate(_W_TRANS)
+        if mm:
+            norms.append(mm)
+    return bool(norms) and _laugh_consume(s, norms)
+
+
+def _clean_roles(roles):
+    out = {}
+    if not isinstance(roles, dict):
+        return out
+    for k, v in roles.items():
+        if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _role_table(ol):
+    raw = ol.get("two_speaker_role_winners") or {}
+    table = {}
+    if not isinstance(raw, dict):
+        return table
+    for k, v in raw.items():
+        parts = [p.strip() for p in str(k).split("+")]
+        if len(parts) != 2 or not parts[0] or not parts[1] or not isinstance(v, str) or not v.strip():
+            continue
+        table["+".join(sorted(parts))] = v.strip()
+    return table
+
+
+def _pair_winner(speakers, roles, ol):
+    """None unless two_speaker is role_map and the pair has exactly one configured winning role."""
+    if str(ol.get("two_speaker", "review")) != "role_map":
+        return None
+    sp = list(speakers)
+    if len(sp) != 2:
+        return None
+    r1, r2 = roles.get(sp[0]), roles.get(sp[1])
+    if not r1 or not r2:
+        return None
+    win = _role_table(ol).get("+".join(sorted([r1, r2])))
+    if not win:
+        return None
+    got = [s for s in sp if roles.get(s) == win]
+    return got[0] if len(got) == 1 else None
+
+
+def _triple_winner(speakers, roles, ol):
+    """The one speaker whose role is neither primary host nor interviewee, or None (fail safe)."""
+    ph = str(ol.get("primary_host_role", "primary_host"))
+    iv = str(ol.get("interviewee_role", "interviewee"))
+    sp = list(speakers)
+    if len(sp) != 3:
+        return None
+    thirds = []
+    for s in sp:
+        role = roles.get(s)
+        if not role:
+            return None
+        if role != ph and role != iv:
+            thirds.append(s)
+    return thirds[0] if len(thirds) == 1 else None
+
+
+def _pure_laugh_spans(ctx, ol):
+    markers = ctx.t.get("laugh_markers") or []
+    limit = int(ol.get("max_laugh_chars", 40))
+    min_span = float(ol.get("min_span_s", 0.15))
+    merge_gap = float(ol.get("merge_gap_s", 0.25))
+    max_speech = float(ol.get("max_speech_overlap_s", 0.0))
+    require_ok = bool(ol.get("require_status_ok", True))
+    ms = ol.get("min_word_score")
+    if ms is None:
+        ms = ctx.cfg.get("align", {}).get("min_word_score", 0.35)
+    ms = float(ms)
+    spans = []
+    for s in ctx.spk:
+        raw = []
+        for g in ctx.words.get(s, []) or []:
+            if require_ok and g.get("status") != "ok":
+                continue
+            if is_question(g.get("text")):
+                continue
+            words = [w for w in (g.get("words") or []) if w.get("start") is not None and w.get("end") is not None]
+            if not words:
+                if is_pure_laugh(g.get("text"), markers, limit) and float(g.get("score") or 0) >= ms:
+                    a, b = float(g["start"]), float(g["end"])
+                    if b - a >= min_span:
+                        raw.append((a, b))
+                continue
+            laugh_w, speech_w = [], []
+            for w in words:
+                surf = w.get("surface") or ""
+                pure = (not is_question(surf)) and is_pure_laugh(surf, markers, limit) and float(w.get("score") or 0) >= ms
+                (laugh_w if pure else speech_w).append(w)
+            for w in laugh_w:
+                a, b = float(w["start"]), float(w["end"])
+                if any(overlap(a, b, float(o["start"]), float(o["end"])) > max_speech for o in speech_w):
+                    continue
+                if b - a >= min_span:
+                    raw.append((a, b))
+        raw.sort()
+        merged = []
+        for a, b in raw:
+            if merged and a <= merged[-1][1] + merge_gap:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        for a, b in merged:
+            if b - a >= min_span:
+                spans.append({"speaker": s, "start": a, "end": b})
+    return spans
+
+
+def _laugh_regions(spans, min_overlap):
+    events = []
+    for i, sp in enumerate(spans):
+        events.append((sp["start"], 1, i))
+        events.append((sp["end"], 0, i))
+    events.sort(key=lambda e: (e[0], e[1]))
+    active, prev_t, prev_sp, raw = set(), None, set(), []
+    for t, kind, i in events:
+        if prev_t is not None and t > prev_t and len(prev_sp) >= 2 and (t - prev_t) >= min_overlap - 1e-9:
+            raw.append({"start": prev_t, "end": t, "speakers": set(prev_sp)})
+        if kind == 0:
+            active.discard(i)
+        else:
+            active.add(i)
+        prev_t = t
+        prev_sp = {spans[j]["speaker"] for j in active}
+    merged = []
+    for reg in raw:
+        if merged and merged[-1]["speakers"] == reg["speakers"] and reg["start"] <= merged[-1]["end"] + 1e-9:
+            merged[-1]["end"] = reg["end"]
+        else:
+            merged.append(reg)
+    return merged
+
+
+def _decide_laugh_region(ctx, reg, roles, ol):
+    spks = reg["speakers"]
+    n = len(spks)
+    if ol.get("respect_edge_protect", True) and ctx.protected_edge(reg["start"], reg["end"]):
+        return None, "edge"
+    if n > int(ol.get("max_decided_speakers", 3)):
+        return None, "too_many"
+    if n == 3:
+        w = _triple_winner(spks, roles, ol)
+        return w, ("triple_keep" if w else "triple_review")
+    if n == 2:
+        w = _pair_winner(spks, roles, ol)
+        return w, ("pair_keep" if w else "pair_review")
+    return None, "too_many"
+
+
+def _merge_laugh_pieces(chunks, gap):
+    chunks = sorted(chunks, key=lambda z: (z[0], z[1]))
+    out = []
+    for a, b, why in chunks:
+        if out and a <= out[-1][1] + gap:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b, why])
+    return out
+
+
+def _laugh_action_why(base, action):
+    if action == "review":
+        return base if base in _LAUGH_WHY else "pair_review"
+    if str(base).startswith("triple"):
+        return "triple_keep" if action == "keep" else "triple_mute"
+    if str(base).startswith("pair"):
+        return "pair_keep" if action == "keep" else "pair_mute"
+    return base
+
+
+def _laugh_cand(ctx, track, t0, t1, action, reason, conf):
+    ex = ctx.excerpt(track, t0, t1)
+    con = ctx.context(t0, t1)
+    return {"key": key("overlap_laughter", track, r(t0), r(t1), action, ex, con), "type": "overlap_laughter",
+            "track": track, "start": r(t0), "end": r(t1), "default_action": action, "reason": reason,
+            "excerpt": ex, "context": con, "confidence": r(conf, 2)}
+
+
+def overlap_laughter(ctx):
+    """Overlapping pure laughter keeps one laugh. Mute only a loser's laughter interval (never a timeline cut).
+
+    Two speakers: no built-in winner (`two_speaker: review`, or `role_map` with an explicit pair entry).
+    Three speakers at once: keep the unique role that is neither primary host nor interviewee; otherwise review.
+    Speech, questions, ordinary backchannels, mixed speech/laughter, and ambiguous detection are not muted."""
+    ol = ctx.c.get("overlap_laughter") or {}
+    if not ol.get("enabled", False):
+        return []
+    spans = _pure_laugh_spans(ctx, ol)
+    if len({sp["speaker"] for sp in spans}) < 2:
+        return []
+    regions = _laugh_regions(spans, float(ol.get("min_overlap_s", 0.2)))
+    if not regions:
+        return []
+    roles = _clean_roles(ctx.roles)
+    for reg in regions:
+        reg["winner"], reg["why"] = _decide_laugh_region(ctx, reg, roles, ol)
+    extent = ol.get("mute_extent", "overlap_only")
+    if extent not in ("overlap_only", "full_span"):
+        extent = "overlap_only"
+    gap = float(ol.get("merge_gap_s", 0.25))
+    floor = float(ol.get("min_span_s", 0.15))
+    pieces = {}
+
+    def add(spk, action, a, b, why):
+        pieces.setdefault((spk, action), []).append((a, b, why))
+
+    if extent == "full_span":
+        for sp in spans:
+            related = [reg for reg in regions if sp["speaker"] in reg["speakers"]
+                       and overlap(sp["start"], sp["end"], reg["start"], reg["end"]) > 0]
+            if not related:
+                continue
+            wins = [reg["winner"] == sp["speaker"] for reg in related]
+            loses = [reg["winner"] is not None and reg["winner"] != sp["speaker"] for reg in related]
+            if any(reg["winner"] is None for reg in related) or (any(wins) and any(loses)):
+                why = "span_conflict" if any(wins) and any(loses) else related[0]["why"]
+                add(sp["speaker"], "review", sp["start"], sp["end"], why)
+            elif any(loses):
+                add(sp["speaker"], "mute", sp["start"], sp["end"], related[0]["why"])
+            elif any(wins):
+                add(sp["speaker"], "keep", sp["start"], sp["end"], related[0]["why"])
+    else:
+        for reg in regions:
+            for sp in spans:
+                if sp["speaker"] not in reg["speakers"]:
+                    continue
+                a, b = max(sp["start"], reg["start"]), min(sp["end"], reg["end"])
+                if b - a <= 1e-9:
+                    continue
+                if reg["winner"] is None:
+                    act = "review"
+                elif reg["winner"] == sp["speaker"]:
+                    act = "keep"
+                else:
+                    act = "mute"
+                add(sp["speaker"], act, a, b, reg["why"])
+    out = []
+    for (spk, action), chunks in pieces.items():
+        for a, b, why in _merge_laugh_pieces(chunks, gap):
+            if b - a < floor - 1e-9:
+                continue
+            if action not in ("mute", "keep", "review") or spk == TIMELINE:
+                continue
+            code = _laugh_action_why(why, action)
+            conf = 0.45 if action == "review" else 0.86
+            out.append(_laugh_cand(ctx, spk, a, b, action, _LAUGH_WHY[code], conf))
+    return out
+
+
+def speaker_roles(ep, cfg):
+    """Episode manifest only. Missing or non-dict map -> no roles (triple rule reviews)."""
+    p = Path(ep) / "manifest.json"
+    if not p.exists():
+        return {}
+    man = load(p)
+    if not isinstance(man, dict):
+        return {}
+    key_name = ((cfg.get("candidates") or {}).get("overlap_laughter") or {}).get("roles_manifest_key", "speaker_roles")
+    roles = man.get(key_name) or {}
+    return roles if isinstance(roles, dict) else {}
+
+
+def build(vad, words, cfg, roles=None):
+    ctx = Ctx(vad, words, cfg, roles)
     my = mutual_yield(ctx); ors0 = overlap_restart(ctx)
     ab = [c for c in overlap_abandon(ctx) if not any(o["track"] == c["track"] and overlap(o["start"], o["end"], c["start"], c["end"]) > 0 for o in ors0)]
-    cs = long_pauses(ctx) + fillers(ctx) + backchannels(ctx) + overlap_yield(ctx) + ors0 + ab + false_starts(ctx) + crosstalk(ctx) + mistakes(ctx)
+    cs = (long_pauses(ctx) + fillers(ctx) + backchannels(ctx) + overlap_yield(ctx) + ors0 + ab + false_starts(ctx)
+          + crosstalk(ctx) + mistakes(ctx) + overlap_laughter(ctx))
     # a mutual_yield cut removes the whole collision: drop the smaller edits inside it (incl. overlap_yield, so
     # keep_overlap_yield cannot keep it)
     myc = [m for m in my if m["default_action"] == "cut"]
@@ -414,11 +732,12 @@ def build(vad, words, cfg):
 
 def auto_decide(cs, ad):
     """Resolve low-information review items to `keep` (no edit) so the human list stays short.
-    Only ever review -> keep: an auto-decision can never cut meaning or a laugh."""
+    Only ever review -> keep: an auto-decision can never cut meaning or a laugh.
+    overlap_laughter is never rewritten (a review stays a review; a mute stays a mute)."""
     if not ad.get("enabled", False):
         return cs
     for c in cs:
-        if c["default_action"] != "review":
+        if c["default_action"] != "review" or c.get("type") == "overlap_laughter":
             continue
         r, why = c["reason"], None
         if c["type"] == "overlap_yield" and ad.get("keep_overlap_yield", True):
@@ -439,7 +758,7 @@ def auto_decide(cs, ad):
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--ep", required=True); a = ap.parse_args()
     ep = Path(a.ep); cfg = load_cfg(ep)
-    cs = build(load(ep / "work/vad.json"), load(ep / "work/words.json"), cfg)
+    cs = build(load(ep / "work/vad.json"), load(ep / "work/words.json"), cfg, speaker_roles(ep, cfg))
     dump(ep / "work/candidates.json", cs)
     stats = {}
     for c in cs:

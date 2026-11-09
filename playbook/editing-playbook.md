@@ -30,11 +30,12 @@
 | `false_start` | かな n-gram の 2 語以内の繰り返し | 他者無発話なら cut 候補、それ以外は review |
 | `crosstalk` | 2 名以上 ≥ `crosstalk_min_s` 重なり | review |
 | `mistake` | `text.mistake_markers`（「ここカットで」等） | review |
+| `overlap_laughter` | 純然たる笑いの重なり（`candidates.overlap_laughter`） | 3人同時は interviewee でも primary host でもない唯一の話者を残し、他の笑い区間だけ自トラック mute。2人は `two_speaker` が review なら人間。タイムラインは切らない |
 
 自動承認は `labels.auto_approve_types` のみ。他は agent/人間のラベルが必要。
 
 ## 4. 絶対にカットしないもの
-意味が変わるカット／ジョーク・笑い・その反応／冒頭・末尾 `candidates.protect_head_tail_s` 秒の内容（該当候補は review）。ブレス処理は行わない（既知の課題）。
+意味が変わるカット／ジョーク・笑い・その反応／冒頭・末尾 `candidates.protect_head_tail_s` 秒の内容（該当候補は review）。ブレス処理は行わない（既知の課題）。重なった純然たる笑いだけは `overlap_laughter` に従い、負けた話者の笑い区間を自トラックで mute できる（タイムラインは切らない）。
 
 ## 5. ラベルとレビュー
 - `labels.json` はキー = hash(候補 + 前後文脈)。再実行で同じ候補には同じラベルが再利用され、`seed` は既存ラベルを上書きしない。未ラベル候補があると render は停止。
@@ -68,9 +69,12 @@
 - 再実行しても二重に入らない（`work/mix_prejingle.wav` から戻す）。`--dry-run` で位置だけ確認できる。
 
 ## 6b. エンディング BGM（pipeline/ending_bgm.py、jingle の後・loudness の前）
-- 編集後トランスクリプトの末尾 `search_window_s`（120 s）以内で最後の締めフレーズ（`phrases`、既定「ということで」）を探し、その `lead_in_s`（3 s）前から `fade_in_s`（2 s）でフェードイン。
-- 声の下では声のアクティブレベル比 `bed_db`（−20 dB、目安 −18〜−22）。最後の発話終了（全話者の VAD）後 `ramp_s`（1.5 s）で `tail_db`（−4 dB）へ上げ、発話終了から `tail_s`（5 s）BGM のみ、`fade_out_s`（7 s）で dB 直線（振幅は指数）に `fade_out_floor_db`（声比 −60 dB）までフェードアウトし、その後 0、さらに `end_silence_s`（1.5 s）のデジタル無音を付ける（QA の末尾無音チェックはフェード開始までで判定）。尺は必要なだけ延長。
-- 音源はリポジトリに入れない（`file` でパス指定）。無効・音源なし・フレーズなしは警告してスキップ（声のミックスはそのまま）。再実行しても BGM は重ならない（`work/mix_voice.wav` から作り直す）。
+- ミッドショーのジングルではない。`jingle.file` には置かない。音源もエピソードごとのアンカーもリポジトリに入れない。
+- `mode: phrase_tail`（`mode` が無い古いエピソード config）: 末尾 `search_window_s` 以内の最後の締めフレーズ（`phrases`）の `lead_in_s` 前からフェードイン。声の下は `bed_db`。最後の発話終了後 `ramp_s` で `tail_db` へ上げ、発話終了から `tail_s` を BGM のみ、`fade_out_s` で dB 直線に `fade_out_floor_db` まで落とし、さらに `end_silence_s`。この包絡より長い音楽はそこで止まる。フレーズが無いときはスキップ。
+- `mode: full_asset`（リポジトリ config の既定）: 音楽は `bgm_offset_s` から EOF まで 1 回。ループしない。`tail_s` / `fade_out_s` では切らない。`tail_fade_ms: 0` なら自然な末尾をホールドしたまま残す。`outro_file` は別資産で、同じく末尾まで 1 回鳴らし、終わりを音楽の終わりに揃える。両方の開始時刻を明示して終わりがずれるときは切らず、`ends_aligned: false`。締めフレーズは見ない。
+- 終端アンカーは編集後タイムライン。`speech_end` = 最後の有効 VAD 終端（最終発話。ミックス末尾の余白より前になり得る）。`episode_end` = 延長前のボイスミックス長（現在のエピソード終端。最終発話の後の無音を含み得る）。`explicit` = エピソード config の `end_anchor_s`。フル尺が `start_floor_s` より前からはみ出すときは両方を同じだけ後ろへずらし、サンプルは捨てない（`end_anchor_met: false`、`anchor_shift_s`）。
+- 発話中は `bed_db`。`gain_speech_end_s`（null ならその VAD 終端）のあと `tail_db` まで上げ、ペイロードの最後まで保持する。この時刻はファイル終端ではない。`end_silence_s` はペイロードの後のデジタル無音。QA の末尾判定は `tail_end_s` まで。
+- 無効・音源なしは警告してスキップ。再実行しても重ならない（`work/mix_voice.wav` から作り直す）。
 - QA：BGM 区間内のつなぎ目は、局所 |diff| の 99.9 パーセンタイル比（`qa.click_ratio_bgm` 2.5）でクリック判定（音楽のアタックを誤検出しない）。
 
 ## 7. ラウドネス（pipeline/loudness.py：唯一のラウドネスツール）
@@ -104,6 +108,21 @@
 
 ### overlap_abandon（言いかけて諦め）
 X の短い発話（≤ `candidates.overlap_abandon.max_s` = 2.0 s、相槌・フィラー・笑いでない）が相手 Y の進行中の内容発話の中にあり、Y が X の終了後 `continue_after_s`（1.0 s）以上話し続け、X が `silent_after_s`（3.0 s）沈黙し、`sentence_end_re`（。?か・です/ます/ね/よ/た/る 等）で終わらない場合、X のトラックだけ自動ミュート。auto-approve 対象。
+
+### overlap_laughter（重なった笑いを一人だけ残す）
+純然たる笑い（`text.laugh_markers` だけでできた区間。繰り返し可）が `min_overlap_s` 以上重なったとき、残すのは一人。負けた話者の笑い区間だけを自トラックで mute し、タイムラインは切らない。パラメータは `candidates.overlap_laughter`。
+
+- 了解できる発話、質問、通常の相槌、発話と笑いが混ざった区間は、このルールでは無音にしない。音響だけの区間・低スコア・質問符を含む区間も自動 mute しない。
+- 役割名は generic（`primary_host_role` / `interviewee_role` / それ以外）。トラックへの対応はエピソード `manifest.json` の `speaker_roles`（キー名は `roles_manifest_key`）だけ。
+- 2人: リポジトリはどちらを残すか決めない。既定 `two_speaker: review`。`two_speaker: role_map` かつ `two_speaker_role_winners` にその役割ペアがあるときだけ自動。無ければレビュー。
+- 3人が同時: interviewee でも primary host でもない話者がちょうど一人ならその笑いを残し、他の二人の笑い区間だけ mute。一意でなければ mute しない。4人以上（`max_decided_speakers`）もレビュー。時間的に連鎖しているだけのペアはトリプルにしない。
+- 保存済みの `labels.json` は `seed` が上書きしない。検出を回さずに足す場合はエピソードの `laughter_edits.json`（リポジトリに置かない）:
+
+```json
+[{"track": "guest_b", "start": 12.0, "end": 13.5, "action": "mute", "kind": "laughter", "approved": true, "note": "pure laugh interval of the losing speaker"}]
+```
+
+`action` は mute、`kind` は laughter、`track` は一人（`all` 不可）。`approved: true` のときだけレンダーに乗る。`python pipeline/label_store.py --ep <ep> build` は既存ラベルを書き換えない。
 
 ### mutual_yield（お見合い・譲り合い）
 2 人の立ち上がりが `overlap_onset_s`（0.5 s）以内、両者とも `yield_max_s`（1.5 s）以内に止まり、片方が `mutual_yield.markers`（どうぞ/お先に）を `yield_marker_window_s`（3 s）以内に言い、もう片方が `restart_window_s`（3 s）以内に話し直した場合、最初の立ち上がりから言い直しの `gap_s`（0.4 s）手前までを **タイムラインカット**（衝突・どうぞ・間の相槌ごと除去）。keep_overlap_yield の対象外で auto-approve。第三者が区間内で話す／頭尾・笑い付近は review。回帰: 20261026 host 1609.06「私なんか」/ guest_a「まあでもなんか」→ host「どうぞ」→ guest_a 1612.26 再開（v8 26:03）。
